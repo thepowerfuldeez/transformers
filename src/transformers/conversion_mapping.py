@@ -122,6 +122,10 @@ def _build_checkpoint_conversion_mapping():
     mapping["qwen3_vl_moe"] = mapping["qwen2_moe"].copy()
     mapping["hunyuan_v1_moe"] = mapping["qwen2_moe"].copy()
     mapping["minimax"] = mapping["mixtral"].copy()
+    if "llama" in mapping:
+        mapping["imu_1"] = mapping["llama"].copy()
+    else:
+        mapping["imu_1"] = {}
 
     return mapping
 

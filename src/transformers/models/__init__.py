@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     from .hgnet_v2 import *
     from .hiera import *
     from .hubert import *
+    from .imu_1 import *
     from .hunyuan_v1_dense import *
     from .hunyuan_v1_moe import *
     from .ibert import *
