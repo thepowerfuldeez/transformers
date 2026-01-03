@@ -84,8 +84,8 @@ class Imu1QKNorm(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         q_dtype, k_dtype = q.dtype, k.dtype
         qf, kf = q.float(), k.float()
-        qf = qf * torch.rsqrt(qf.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
-        kf = kf * torch.rsqrt(kf.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+        qf = qf * torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
+        kf = kf * torch.rsqrt(kf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
         gain = self.gain.to(qf)
         return (qf * gain).to(q_dtype), kf.to(k_dtype)
 
@@ -172,7 +172,7 @@ class Imu1Attention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = 1.0 if config.attn_qknorm else self.head_dim**-0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = 0.0
         self.is_causal = True
 
@@ -217,7 +217,7 @@ class Imu1Attention(nn.Module):
 
         if self.gating == "per-head-hd":
             gate_input = gate_input[..., : self.head_dim]
-        gate = self.attn_gate(gate_input).sigmoid()
+        gate = self.attn_gate(gate_input).sigmoid() * 2.0
         if self.gating == "elementwise":
             return attn_output * gate
 
