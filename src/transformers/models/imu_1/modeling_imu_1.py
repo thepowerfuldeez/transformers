@@ -59,7 +59,7 @@ class Imu1RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.register_buffer("position_scale", torch.tensor(position_scale, dtype=torch.float32), persistent=False)
+        self.register_buffer("position_scale", torch.tensor(position_scale, dtype=torch.float32), persistent=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -100,8 +100,10 @@ class Imu1RotaryEmbedding(nn.Module):
         self.base = config.rope_theta
         self.max_seq_len_cached = config.max_position_embeddings
         cos, sin = self._build_cache(self.max_seq_len_cached)
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
+        # NOTE: persistent=True to work around transformers bug where non-persistent buffers
+        # get replaced with empty tensors during from_pretrained()
+        self.register_buffer("cos_cached", cos, persistent=True)
+        self.register_buffer("sin_cached", sin, persistent=True)
 
     def _build_cache(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.cos_cached.device if hasattr(self, "cos_cached") else torch.device("cpu")
@@ -116,8 +118,8 @@ class Imu1RotaryEmbedding(nn.Module):
             return
         cos, sin = self._build_cache(seq_len)
         self.max_seq_len_cached = seq_len
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
+        self.register_buffer("cos_cached", cos, persistent=True)
+        self.register_buffer("sin_cached", sin, persistent=True)
 
     def forward(
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor
@@ -267,10 +269,18 @@ class Imu1Attention(nn.Module):
 
         value_states = mixed_v
 
-        # Use SDPA instead of manual attention computation
-        # SDPA handles the 1/sqrt(d_k) scaling automatically
-        # When attention_mask is provided, use it; otherwise use causal masking
+        # IMPORTANT: Native implementation uses (heads*batch, seq, head_dim) layout for SDPA
+        # We must match this layout to get identical results (heads first, not batch first!)
+        # Current shapes: q (bsz, num_heads, q_len, head_dim), key_states/value_states (bsz, num_heads, k_len, head_dim)
+        # Target: (num_heads*bsz, seq_len, head_dim) - NOTE: heads*bsz, not bsz*heads!
+        k_len = key_states.size(2)  # Key/value sequence length may differ from q_len during generation
+        q = q.permute(1, 0, 2, 3).reshape(self.num_heads * bsz, q_len, self.head_dim)
+        key_states = key_states.permute(1, 0, 2, 3).reshape(self.num_heads * bsz, k_len, self.head_dim)
+        value_states = value_states.permute(1, 0, 2, 3).reshape(self.num_heads * bsz, k_len, self.head_dim)
+
+        # Use SDPA with native layout
         if attention_mask is not None:
+            # Need to reshape attention mask to match
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q, key_states, value_states,
                 attn_mask=attention_mask,
@@ -284,7 +294,8 @@ class Imu1Attention(nn.Module):
             )
 
         attn_weights = None  # SDPA doesn't return weights
-        attn_output = attn_output.transpose(1, 2).contiguous()  # (bsz, q_len, num_heads, head_dim)
+        # Reshape back from (num_heads*bsz, q_len, head_dim) to (bsz, q_len, num_heads*head_dim)
+        attn_output = attn_output.reshape(self.num_heads, bsz, q_len, self.head_dim).permute(1, 2, 0, 3).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.q_size)
         attn_output = self._apply_gating(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
