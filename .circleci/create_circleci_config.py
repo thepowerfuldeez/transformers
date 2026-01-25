@@ -64,7 +64,6 @@ class EmptyJob:
             steps.extend(
                 [
                     "checkout",
-                    {"run": "pip install requests || true"},
                     {"run": """while [[ $(curl --location --request GET "https://circleci.com/api/v2/workflow/$CIRCLE_WORKFLOW_ID/job" --header "Circle-Token: $CCI_TOKEN"| jq -r '.items[]|select(.name != "collection_job")|.status' | grep -c "running") -gt 0 ]]; do sleep 5; done || true"""},
                     {"run": 'python utils/process_circleci_workflow_test_reports.py --workflow_id $CIRCLE_WORKFLOW_ID || true'},
                     {"store_artifacts": {"path": "outputs"}},
@@ -318,6 +317,14 @@ non_model_job = CircleCIJob(
     parallelism=6,
 )
 
+training_ci_job = CircleCIJob(
+    "training_ci",
+    additional_env={"RUN_TRAINING_TESTS": True},
+    docker_image=[{"image": "huggingface/transformers-torch-light"}],
+    install_steps=["uv pip install ."],
+    marker="is_training_test",
+    parallelism=6,
+)
 
 # We also include a `dummy.py` file in the files to be doc-tested to prevent edge case failure. Otherwise, the pytest
 # hangs forever during test collection while showing `collecting 0 items / 21 errors`. (To see this, we have to remove
@@ -348,7 +355,8 @@ EXAMPLES_TESTS = [examples_torch_job]
 PIPELINE_TESTS = [pipelines_torch_job]
 REPO_UTIL_TESTS = [repo_utils_job]
 DOC_TESTS = [doc_test_job]
-ALL_TESTS = REGULAR_TESTS + EXAMPLES_TESTS + PIPELINE_TESTS + REPO_UTIL_TESTS + DOC_TESTS + [custom_tokenizers_job] + [exotic_models_job]  # fmt: skip
+TRAINING_CI_TESTS = [training_ci_job]
+ALL_TESTS = REGULAR_TESTS + EXAMPLES_TESTS + PIPELINE_TESTS + REPO_UTIL_TESTS + DOC_TESTS + [custom_tokenizers_job] + [exotic_models_job] + TRAINING_CI_TESTS  # fmt: skip
 
 
 def create_circleci_config(folder=None):
