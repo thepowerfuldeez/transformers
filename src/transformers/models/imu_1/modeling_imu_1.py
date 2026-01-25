@@ -76,16 +76,17 @@ class Imu1RMSNorm(nn.Module):
 class Imu1QKNorm(nn.Module):
     """Lightweight query/key normalization with a learned gain."""
 
-    def __init__(self, context_length: int):
+    def __init__(self, head_dim: int):
         super().__init__()
-        gain_value = math.log2(float(context_length**2 - context_length))
-        self.gain = nn.Parameter(torch.tensor([gain_value], dtype=torch.float32))
+        # Initialize gain to 1.0 to match reference implementation
+        self.gain = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         q_dtype, k_dtype = q.dtype, k.dtype
         qf, kf = q.float(), k.float()
-        qf = qf * torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
-        kf = kf * torch.rsqrt(kf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
+        # Use eps=1e-6 to match reference implementation
+        qf = qf * torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        kf = kf * torch.rsqrt(kf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
         gain = self.gain.to(qf)
         return (qf * gain).to(q_dtype), kf.to(k_dtype)
 
@@ -147,16 +148,16 @@ def apply_imu1_rotary_pos_emb(
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     def _rotate(x: torch.Tensor) -> torch.Tensor:
-        x_shape = x.shape
-        x = x.float().view(*x_shape[:-1], -1, 2)
-        x1, x2 = x.unbind(dim=-1)
-        cos_view = cos.unsqueeze(1)
+        # Use split-half format (LLaMA style, rope_interleaved=False)
+        # Split the last dimension in half and rotate (x[:half], x[half:]) pairs
+        x_f = x.float()
+        half = x_f.size(-1) // 2
+        x1, x2 = x_f[..., :half], x_f[..., half:]
+        cos_view = cos.unsqueeze(1)  # (bsz, 1, seq_len, head_dim//2)
         sin_view = sin.unsqueeze(1)
-        rotated = torch.stack(
-            (x1 * cos_view - x2 * sin_view, x1 * sin_view + x2 * cos_view),
-            dim=-1,
-        )
-        return rotated.view(*x_shape).to(dtype=q.dtype)
+        row1 = x1 * cos_view - x2 * sin_view
+        row2 = x1 * sin_view + x2 * cos_view
+        return torch.cat([row1, row2], dim=-1).to(dtype=x.dtype)
 
     return _rotate(q), _rotate(k)
 
@@ -196,8 +197,10 @@ class Imu1Attention(nn.Module):
         # qk-norm is parameterized by head dimension (see reference implementation)
         self.qk_norm = Imu1QKNorm(self.head_dim) if config.attn_qknorm else None
         if config.attn_val_residual:
-            self.alpha1 = nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
-            self.alpha2 = nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
+            # Initialize as parameters that can be trained
+            # Start with alpha1=1.0, alpha2=0.0 to match reference (not 0.5, 0.5)
+            self.alpha1 = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+            self.alpha2 = nn.Parameter(torch.tensor([0.0], dtype=torch.float32))
             self.value_scale = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
         else:
             self.register_buffer("alpha1", torch.tensor([1.0]), persistent=False)
@@ -252,42 +255,36 @@ class Imu1Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
-        if self.qk_norm is not None:
-            q, k = self.qk_norm(q, k)
-
-        mixed_v, value_residual_out = self._mix_values(v, value_residual)
-
+        # Repeat KV heads BEFORE QKNorm and value mixing (matches native implementation)
         key_states = repeat_kv(k, self.num_key_value_groups)
-        value_states = repeat_kv(mixed_v, self.num_key_value_groups)
+        v_repeated = repeat_kv(v, self.num_key_value_groups)
 
-        q_flat = q.reshape(bsz * self.num_heads, q_len, self.head_dim)
-        k_flat = key_states.reshape(bsz * self.num_heads, -1, self.head_dim)
-        v_flat = value_states.reshape(bsz * self.num_heads, -1, self.head_dim)
-        key_len = k_flat.size(1)
+        mixed_v, value_residual_out = self._mix_values(v_repeated, value_residual)
 
-        # Build a causal mask that accounts for cached tokens.
-        if cache_position is not None:
-            q_positions = cache_position
-        else:
-            q_positions = torch.arange(q_len, device=hidden_states.device)
-        k_positions = torch.arange(key_len, device=hidden_states.device)
-        causal_mask = q_positions.unsqueeze(-1) >= k_positions
-        causal_mask = causal_mask.to(torch.bool)
+        # Apply QKNorm after repeating (matches native implementation)
+        if self.qk_norm is not None:
+            q, key_states = self.qk_norm(q, key_states)
 
-        scores = torch.bmm(q_flat.float(), k_flat.transpose(1, 2).float()) * float(self.scaling)
-        scores = scores.view(bsz, self.num_heads, q_len, key_len)
+        value_states = mixed_v
+
+        # Use SDPA instead of manual attention computation
+        # SDPA handles the 1/sqrt(d_k) scaling automatically
+        # When attention_mask is provided, use it; otherwise use causal masking
         if attention_mask is not None:
-            scores = scores + attention_mask[:, :, -q_len:, :key_len]
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, key_states, value_states,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+            )
         else:
-            scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, key_states, value_states,
+                dropout_p=0.0,
+                is_causal=True,
+            )
 
-        attn_weights = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.bmm(
-            attn_weights.view(bsz * self.num_heads, q_len, key_len),
-            v_flat.float(),
-        )
-
-        attn_output = attn_output.view(bsz, self.num_heads, q_len, self.head_dim).transpose(1, 2)
+        attn_weights = None  # SDPA doesn't return weights
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (bsz, q_len, num_heads, head_dim)
         attn_output = attn_output.reshape(bsz, q_len, self.q_size)
         attn_output = self._apply_gating(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
